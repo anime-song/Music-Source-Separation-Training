@@ -256,7 +256,7 @@ def get_model_from_config(model_type: str, config_path: str) -> Tuple:
         model = MelBandRoformer(**dict(config.model))
     elif model_type == 'bs_roformer':
         from models.bs_roformer import BSRoformer
-        model = BSRoformer(**dict(config.model))
+        model = BSRoformer(**dict(config.model)).half()
     elif model_type == 'bs_roformer_experimental':
         from models.bs_roformer.bs_roformer_experimental import BSRoformer
         model = BSRoformer(**dict(config.model))
