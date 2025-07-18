@@ -85,8 +85,8 @@ def demix(
         with torch.inference_mode():
             # Initialize result and counter tensors
             req_shape = (num_instruments,) + mix.shape
-            result = torch.zeros(req_shape, dtype=torch.float16)
-            counter = torch.zeros(req_shape, dtype=torch.float16)
+            result = torch.zeros(req_shape, dtype=torch.float32)
+            counter = torch.zeros(req_shape, dtype=torch.float32)
 
             i = 0
             batch_data = []
@@ -412,7 +412,7 @@ def load_not_compatible_weights(model: torch.nn.Module, weights: str, verbose: b
                     # print(slices_old, slices_new)
                     slices_old = tuple(slices_old)
                     slices_new = tuple(slices_new)
-                    max_matrix = np.zeros(max_shape, dtype=np.float16)
+                    max_matrix = np.zeros(max_shape, dtype=np.float32)
                     for i in range(ln):
                         max_matrix[slices_old] = old_model[el].cpu().numpy()
                     max_matrix = torch.from_numpy(max_matrix)
