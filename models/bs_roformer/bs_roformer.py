@@ -91,15 +91,17 @@ class BandSplit(torch.nn.Module):
         self.band_indices = band_indices
 
         for i, idx in enumerate(band_indices):
-            self.register_buffer(f"band_idx_{i}", torch.tensor(idx, dtype=torch.long))
+            self.register_buffer(
+                f"band_idx_{i}", torch.tensor(idx, dtype=torch.long), persistent=False
+            )
 
         self.num_bands = len(band_indices)
-        self.projections = torch.nn.ModuleList([])
+        self.to_features = torch.nn.ModuleList([])
         for i in range(self.num_bands):
             sub_band_freqs = (
                 len(band_indices[i]) * num_channels * 2 * (extra_windows + 1)
             )
-            self.projections.append(
+            self.to_features.append(
                 torch.nn.Sequential(
                     RMSNorm(sub_band_freqs),
                     torch.nn.Linear(sub_band_freqs, hidden_size),
@@ -109,7 +111,7 @@ class BandSplit(torch.nn.Module):
     def forward(self, x):
         # x: (B, T, C, F)
         sub_band_list = []
-        for i, proj_layer in enumerate(self.projections):
+        for i, proj_layer in enumerate(self.to_features):
             band_indices = getattr(self, f"band_idx_{i}")
             # サブバンドインデックスで周波数軸から抜きだす
             sub_band = x[..., band_indices]  # (B, T, C, sub_band_freqs)
@@ -147,10 +149,10 @@ class MaskEstimator(nn.Module):
         self.band_indices = band_indices
 
         self.num_bands = len(band_indices)
-        self.projections = torch.nn.ModuleList([])
+        self.to_features = torch.nn.ModuleList([])
         for i in range(self.num_bands):
             sub_band_freqs = len(band_indices[i]) * num_channels * 2
-            self.projections.append(
+            self.to_features.append(
                 nn.Sequential(
                     band_mask_mlp(
                         input_dim=input_dim,
@@ -166,9 +168,9 @@ class MaskEstimator(nn.Module):
         # x: (B, T, K, D)
         out = []
         sub_band_list = torch.unbind(x, dim=2)  # list([B, T, D])
-        assert len(sub_band_list) == len(self.projections)
+        assert len(sub_band_list) == len(self.to_features)
 
-        for i, proj_layer in enumerate(self.projections):
+        for i, proj_layer in enumerate(self.to_features):
             sub_band = proj_layer(sub_band_list[i])  # (B, T, sub_band_freqs)
             sub_band = einops.rearrange(
                 sub_band,
@@ -232,8 +234,8 @@ class BSRoformer(nn.Module):
         self.layers = nn.ModuleList([])
         if use_shared_bias:
             hidden_size = head_dim * num_heads
-            self.linear_62_bias_0 = nn.Parameter(torch.ones(hidden_size * 3))  # QKV
-            self.linear_64_bias_0 = nn.Parameter(torch.ones(dim))  # OUT
+            self.shared_qkv_bias = nn.Parameter(torch.ones(hidden_size * 3))  # QKV
+            self.shared_out_bias = nn.Parameter(torch.ones(dim))  # OUT
 
         for _ in range(num_layers):
             time_roformer = Transformer(
@@ -243,6 +245,8 @@ class BSRoformer(nn.Module):
                 num_heads=num_heads,
                 ffn_hidden_size_factor=ffn_hidden_size_factor,
                 dropout=dropout,
+                shared_qkv_bias=self.shared_qkv_bias,
+                shared_out_bias=self.shared_out_bias,
             )
             band_roformer = Transformer(
                 input_dim=dim,
@@ -251,6 +255,8 @@ class BSRoformer(nn.Module):
                 num_heads=num_heads,
                 ffn_hidden_size_factor=ffn_hidden_size_factor,
                 dropout=dropout,
+                shared_qkv_bias=self.shared_qkv_bias,
+                shared_out_bias=self.shared_out_bias,
             )
             self.layers.append(nn.ModuleList([time_roformer, band_roformer]))
 

@@ -171,12 +171,12 @@ class MultiHeadAttention(nn.Module):
             self.to_qkv.bias = shared_qkv_bias
 
         self.to_gates = nn.Linear(input_dim, num_heads)
-        self.out_proj = nn.Sequential(
+        self.to_out = nn.Sequential(
             nn.Linear(self.hidden_size, input_dim, bias=(shared_out_bias is not None)),
             nn.Dropout(dropout),
         )
         if shared_out_bias is not None:
-            self.out_proj[0].bias = shared_out_bias
+            self.to_out[0].bias = shared_out_bias
 
         self.rope = RotaryEmbeddings(
             head_dim=self.head_dim,
@@ -211,7 +211,7 @@ class MultiHeadAttention(nn.Module):
 
         out = fetched.float() * einops.rearrange(gates, "b n h -> b h n 1")
         out = einops.rearrange(out, "b h t d -> b t (h d)")
-        return self.out_proj(out)
+        return self.to_out(out)
 
 
 class Transformer(nn.Module):
