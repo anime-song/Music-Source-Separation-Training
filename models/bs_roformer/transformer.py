@@ -229,6 +229,7 @@ class Transformer(nn.Module):
         dropout: float = 0.0,
         shared_qkv_bias=None,
         shared_out_bias=None,
+        output_norm: bool = False,
     ):
         super().__init__()
         self.layers = nn.ModuleList([])
@@ -252,7 +253,7 @@ class Transformer(nn.Module):
                 )
             )
 
-        self.norm = RMSNorm(input_dim)
+        self.norm = RMSNorm(input_dim) if output_norm else nn.Identity()
 
     def forward(self, x):
         # x: [B, T, F]
