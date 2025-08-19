@@ -1,0 +1,25 @@
+audio:
+  chunk_size: 588800
+  dim_f: 1024
+  dim_t: 801
+  hop_length: 441
+  n_fft: 2048
+  num_channels: 2
+  sample_rate: 44100
+  min_mean_abs: 0.000
+
+model:
+  dim: 256
+  num_layers: 12
+  num_stems: 6
+  use_shared_bias: True
+
+training:
+  instruments: ['bass', 'drums', 'other', 'vocals', 'guitar', 'piano']
+  use_amp: true # enable fp16 support
+
+inference:
+  batch_size: 2
+  dim_t: 1101
+  num_overlap: 2
+  normalize: false
