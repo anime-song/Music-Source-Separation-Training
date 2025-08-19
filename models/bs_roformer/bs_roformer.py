@@ -260,7 +260,7 @@ class BSRoformer(nn.Module):
             )
             self.layers.append(nn.ModuleList([time_roformer, band_roformer]))
 
-        self.out_norm = RMSNorm(dim)
+        self.final_norm = RMSNorm(dim)
 
         self.register_buffer(
             "freq_indices",
@@ -396,7 +396,7 @@ class BSRoformer(nn.Module):
             x = checkpoint(band_roformer, x, use_reentrant=False)
             x = x.reshape(B, T, K, F)
 
-        x = self.out_norm(x)
+        x = self.final_norm(x)
 
         # 音源分離マスク
         mask_list = []

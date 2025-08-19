@@ -248,7 +248,7 @@ class Transformer(nn.Module):
                 )
             )
 
-        self.out_norm = RMSNorm(input_dim)
+        self.norm = RMSNorm(input_dim)
 
     def forward(self, x):
         # x: [B, T, F]
@@ -256,5 +256,5 @@ class Transformer(nn.Module):
             x = attention(x) + x
             x = ffn(x) + x
 
-        x = self.out_norm(x)
+        x = self.norm(x)
         return x
