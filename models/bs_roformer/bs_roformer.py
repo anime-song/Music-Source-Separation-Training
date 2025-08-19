@@ -4,7 +4,7 @@ import torch.utils.checkpoint
 import librosa
 import numpy as np
 import einops
-from .transformer import Transformer, RMSNorm, RotaryEmbedding
+from .transformer import Transformer, RMSNorm
 
 from typing import List, Tuple
 
@@ -115,7 +115,7 @@ class BandSplit(torch.nn.Module):
             band_indices = getattr(self, f"band_idx_{i}")
             # サブバンドインデックスで周波数軸から抜きだす
             sub_band = x[..., band_indices]  # (B, T, C, sub_band_freqs)
-            sub_band = einops.rearrange(sub_band, "b t c f -> b t (c f)")
+            sub_band = einops.rearrange(sub_band, "b t c f -> b t (f c)")
             sub_band = proj_layer(sub_band)  # (B, T, hidden_size)
             sub_band_list.append(sub_band)
 
@@ -174,7 +174,7 @@ class MaskEstimator(nn.Module):
             sub_band = proj_layer(sub_band_list[i])  # (B, T, sub_band_freqs)
             sub_band = einops.rearrange(
                 sub_band,
-                "b t (c f) -> b t c f",
+                "b t (f c) -> b t c f",
                 c=self.num_channels * 2,
                 f=len(self.band_indices[i]),
             )
@@ -233,24 +233,11 @@ class BSRoformer(nn.Module):
             extra_windows=0,
         )
 
-        t_frames = 1151  # e.g. 588800 // 512 + 1 = 1151
-        self.cos_emb_time = nn.Parameter(torch.zeros(t_frames, head_dim))
-        self.sin_emb_time = nn.Parameter(torch.zeros(t_frames, head_dim))
-        time_rotary_embed = RotaryEmbedding(
-            cos_emb=self.cos_emb_time, sin_emb=self.sin_emb_time
-        )
-
-        self.cos_emb_freq = nn.Parameter(torch.zeros(self.num_bands, head_dim))
-        self.sin_emb_freq = nn.Parameter(torch.zeros(self.num_bands, head_dim))
-        freq_rotary_embed = RotaryEmbedding(
-            cos_emb=self.cos_emb_freq, sin_emb=self.sin_emb_freq
-        )
-
         self.layers = nn.ModuleList([])
         if use_shared_bias:
             hidden_size = head_dim * num_heads
-            self.shared_qkv_bias = nn.Parameter(torch.ones(hidden_size * 3))  # QKV
-            self.shared_out_bias = nn.Parameter(torch.ones(dim))  # OUT
+            self.shared_qkv_bias = nn.Parameter(torch.zeros(hidden_size * 3))  # QKV
+            self.shared_out_bias = nn.Parameter(torch.zeros(dim))  # OUT
 
         for _ in range(num_layers):
             time_roformer = Transformer(
@@ -262,7 +249,6 @@ class BSRoformer(nn.Module):
                 dropout=dropout,
                 shared_qkv_bias=self.shared_qkv_bias,
                 shared_out_bias=self.shared_out_bias,
-                rotary_embed=time_rotary_embed,
             )
             band_roformer = Transformer(
                 input_dim=dim,
@@ -273,7 +259,6 @@ class BSRoformer(nn.Module):
                 dropout=dropout,
                 shared_qkv_bias=self.shared_qkv_bias,
                 shared_out_bias=self.shared_out_bias,
-                rotary_embed=freq_rotary_embed,
             )
             self.layers.append(nn.ModuleList([time_roformer, band_roformer]))
 
@@ -333,6 +318,20 @@ class BSRoformer(nn.Module):
         spectrogram = einops.rearrange(spectrogram, "b c f t s -> b (c s) t f", s=2)
         return spectrogram, spectrograms[0]
 
+    def mixture_consistency_projection(
+        self,
+        source_estimates: torch.Tensor,  # [B, C, N, F, T] complex
+        mixture: torch.Tensor,  # [B, C, F, T] complex
+        weights: torch.Tensor | None = None,  # [B, C, N, F, T] real, 任意
+    ) -> torch.Tensor:
+        residual = mixture[:, :, None] - source_estimates.sum(dim=2, keepdim=True)
+        if weights is None:
+            correction = residual / source_estimates.shape[2]
+        else:
+            weights = weights / (weights.sum(dim=2, keepdim=True) + 1e-8)
+            correction = weights * residual
+        return source_estimates + correction
+
     def to_recon_audio(
         self,
         mask: torch.Tensor,
@@ -344,8 +343,17 @@ class BSRoformer(nn.Module):
         # mask: [B, C, N, F, T]
         source_estimates = original_spec_complex[:, :, None] * mask
 
+        # mixture consistency
+        magnitude = source_estimates.abs().clamp_min(1e-8)
+        weights = magnitude**2
+        separated_spectrogram = self.mixture_consistency_projection(
+            source_estimates=source_estimates,
+            mixture=original_spec_complex,
+            weights=weights,
+        )
+
         separated_spectrogram = einops.rearrange(
-            source_estimates, "b c n f t -> (b c n) f t"
+            separated_spectrogram, "b c n f t -> (b c n) f t"
         )
         recon_audio = torch.istft(
             separated_spectrogram,

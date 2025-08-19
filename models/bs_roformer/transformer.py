@@ -40,29 +40,99 @@ class RMSNorm(nn.Module):
         return normalized_x * self.scale * self.gamma
 
 
-class RotaryEmbedding(nn.Module):
-    def __init__(self, cos_emb, sin_emb):
+class RotaryEmbeddings(torch.nn.Module):
+    """
+    RoPE 用の sin・cos テーブルをキャッシュし、必要に応じて伸張／切り詰めるクラス。
+
+    Args:
+        head_dim: 1 ヘッドあたりの埋め込み次元 (必ず偶数にする)
+        max_seq_len: 事前に準備しておく最大シーケンス長
+        base_theta: 周波数スケーリング係数 (多くの論文では 10000.0)
+        learned: True にすると sin, cos をパラメータとして学習させられる
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        max_seq_len: int = 2048,
+        base_theta: float = 10000.0,
+        learned: bool = False,
+        device: torch.device | None = None,
+    ):
         super().__init__()
-        # both (seq_len_for_rotation, dim_head)
-        self.cos_emb = cos_emb
-        self.sin_emb = sin_emb
 
-    def rotate_half(self, x):
-        x = einops.rearrange(x, "... (d r) -> ... d r", r=2)
-        x1, x2 = x.unbind(dim=-1)
-        x = torch.stack((-x2, x1), dim=-1)
-        return einops.rearrange(x, "... d r -> ... (d r)")
+        if head_dim % 2 != 0:
+            raise ValueError("head_dim (＝1 ヘッドの次元数) は偶数にしてください。")
 
-    def forward(self, x):
-        # x is (batch_eff, heads, seq_len_for_rotation, dim_head)
-        cos_b = self.cos_emb.unsqueeze(0).unsqueeze(0).to(x.device, x.dtype)
-        sin_b = self.sin_emb.unsqueeze(0).unsqueeze(0).to(x.device, x.dtype)
+        self.head_dim = head_dim
+        self.base_theta = base_theta
+        self.max_seq_len = max_seq_len
 
-        term1 = x * cos_b
-        term2 = self.rotate_half(x) * sin_b
+        # 角周波数: θ_k = (θ_base)^(2k / d)
+        freqs = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+        inv_freq = 1.0 / (base_theta ** (freqs / head_dim))  # (head_dim/2,)
 
-        sum = term1.to(torch.float32) + term2.to(torch.float32)
-        return sum.to(x.dtype)
+        # time 方向へアウター積 → (max_seq_len, head_dim/2)
+        t = torch.arange(max_seq_len, device=device).float()
+        sinusoid_inp = torch.einsum("i,j->ij", t, inv_freq)
+
+        sin, cos = (
+            sinusoid_inp.sin(),
+            sinusoid_inp.cos(),
+        )  # 各が (max_seq_len, head_dim/2)
+
+        if learned:
+            self.register_parameter("sin_cached", torch.nn.Parameter(sin))
+            self.register_parameter("cos_cached", torch.nn.Parameter(cos))
+        else:
+            self.register_buffer("sin_cached", sin, persistent=False)
+            self.register_buffer("cos_cached", cos, persistent=False)
+
+    def forward(
+        self,
+        seq_len: int,
+        dtype: torch.dtype = torch.float32,
+        device: torch.device | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        指定長の sin, cos を返す。
+
+        Returns:
+            cos: (seq_len, head_dim/2)
+            sin: (seq_len, head_dim/2)
+        """
+        if seq_len > self.max_seq_len:
+            raise ValueError(
+                f"要求シーケンス長 {seq_len} は max_seq_len={self.max_seq_len} を超えています。"
+            )
+        cos = self.cos_cached[:seq_len].to(dtype=dtype, device=device)
+        sin = self.sin_cached[:seq_len].to(dtype=dtype, device=device)
+        return cos, sin
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """
+    偶数次元のテンソルを (…, 2i, 2i+1) → (…, -2i+1, 2i) のように 90° 回転させる。
+    具体的には (x_even, x_odd) → (-x_odd, x_even)。
+    """
+    x_even, x_odd = x[..., 0::2], x[..., 1::2]
+    return torch.stack((-x_odd, x_even), dim=-1).flatten(-2)
+
+
+def apply_rotary_embedding(
+    query: torch.Tensor,  # (batch, num_heads, seq_len, head_dim)
+    key: torch.Tensor,  # (batch, num_heads, seq_len, head_dim)
+    cos: torch.Tensor,  # (seq_len, head_dim/2)
+    sin: torch.Tensor,  # (seq_len, head_dim/2)
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
+    cos = torch.repeat_interleave(cos, 2, dim=-1)
+    sin = torch.repeat_interleave(sin, 2, dim=-1)
+
+    q_rot = query * cos + rotate_half(query) * sin
+    k_rot = key * cos + rotate_half(key) * sin
+    return q_rot, k_rot
 
 
 class FeedForward(nn.Module):
@@ -90,7 +160,6 @@ class MultiHeadAttention(nn.Module):
         head_dim=64,
         shared_qkv_bias=None,
         shared_out_bias=None,
-        rotary_embed: RotaryEmbedding | None = None,
         dropout=0.0,
     ):
         super().__init__()
@@ -113,7 +182,10 @@ class MultiHeadAttention(nn.Module):
         if shared_out_bias is not None:
             self.to_out[0].bias = shared_out_bias
 
-        self.rotary_embed = rotary_embed
+        self.rope = RotaryEmbeddings(
+            head_dim=self.head_dim,
+            learned=False,
+        )
         self.lowp_dtype = choose_low_precision_dtype()
 
     def forward(self, x):
@@ -123,9 +195,8 @@ class MultiHeadAttention(nn.Module):
             self.to_qkv(x), "b t (qkv h d) -> qkv b h t d", qkv=3, h=self.num_heads
         )
 
-        if self.rotary_embed is not None:
-            q = self.rotary_embed(q)
-            k = self.rotary_embed(k)
+        cos, sin = self.rope(q.shape[-2], dtype=q.dtype, device=q.device)
+        q, k = apply_rotary_embedding(q, k, cos, sin)
 
         q = q.to(self.lowp_dtype)
         k = k.to(self.lowp_dtype)
@@ -159,7 +230,6 @@ class Transformer(nn.Module):
         shared_qkv_bias=None,
         shared_out_bias=None,
         output_norm: bool = False,
-        rotary_embed: RotaryEmbedding | None = None,
     ):
         super().__init__()
         self.layers = nn.ModuleList([])
@@ -171,7 +241,6 @@ class Transformer(nn.Module):
                 num_heads=num_heads,
                 shared_qkv_bias=shared_qkv_bias,
                 shared_out_bias=shared_out_bias,
-                rotary_embed=rotary_embed,
             )
             self.layers.append(
                 nn.ModuleList(
