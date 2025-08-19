@@ -149,10 +149,10 @@ class MaskEstimator(nn.Module):
         self.band_indices = band_indices
 
         self.num_bands = len(band_indices)
-        self.to_features = torch.nn.ModuleList([])
+        self.to_freqs = torch.nn.ModuleList([])
         for i in range(self.num_bands):
             sub_band_freqs = len(band_indices[i]) * num_channels * 2
-            self.to_features.append(
+            self.to_freqs.append(
                 nn.Sequential(
                     band_mask_mlp(
                         input_dim=input_dim,
@@ -168,9 +168,9 @@ class MaskEstimator(nn.Module):
         # x: (B, T, K, D)
         out = []
         sub_band_list = torch.unbind(x, dim=2)  # list([B, T, D])
-        assert len(sub_band_list) == len(self.to_features)
+        assert len(sub_band_list) == len(self.to_freqs)
 
-        for i, proj_layer in enumerate(self.to_features):
+        for i, proj_layer in enumerate(self.to_freqs):
             sub_band = proj_layer(sub_band_list[i])  # (B, T, sub_band_freqs)
             sub_band = einops.rearrange(
                 sub_band,
@@ -222,7 +222,9 @@ class BSRoformer(nn.Module):
         else:
             raise NotImplementedError("サポートしていない band_split_type です")
 
-        self.register_buffer("hann_window", torch.hann_window(self.window_size))
+        self.register_buffer(
+            "hann_window", torch.hann_window(self.window_size), persistent=False
+        )
         self.num_bands = len(self.band_indices)
         self.band_split = BandSplit(
             hidden_size=dim,

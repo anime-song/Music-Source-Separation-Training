@@ -27,13 +27,17 @@ def choose_low_precision_dtype() -> torch.dtype:
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, eps: float = 5.960464477539063e-08):  # 0x1p-24
         super().__init__()
         self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.ones(dim))
+        self.eps = eps
 
     def forward(self, x):
-        return F.normalize(x, dim=-1) * self.scale * self.gamma
+        l2_norm = torch.linalg.norm(x, dim=-1, keepdim=True)
+        denom = torch.maximum(l2_norm, torch.full_like(l2_norm, self.eps))
+        normalized_x = x / denom
+        return normalized_x * self.scale * self.gamma
 
 
 class RotaryEmbeddings(torch.nn.Module):
