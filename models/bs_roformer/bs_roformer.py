@@ -4,7 +4,7 @@ import torch.utils.checkpoint
 import librosa
 import numpy as np
 import einops
-from .transformer import Transformer, RMSNorm
+from .transformer import Transformer, RMSNorm, RotaryEmbedding
 
 from typing import List, Tuple
 
@@ -233,6 +233,19 @@ class BSRoformer(nn.Module):
             extra_windows=0,
         )
 
+        t_frames = 1151  # e.g. 588800 // 512 + 1 = 1151
+        self.cos_emb_time = nn.Parameter(torch.zeros(t_frames, head_dim))
+        self.sin_emb_time = nn.Parameter(torch.zeros(t_frames, head_dim))
+        time_rotary_embed = RotaryEmbedding(
+            cos_emb=self.cos_emb_time, sin_emb=self.sin_emb_time
+        )
+
+        self.cos_emb_freq = nn.Parameter(torch.zeros(self.num_bands, head_dim))
+        self.sin_emb_freq = nn.Parameter(torch.zeros(self.num_bands, head_dim))
+        freq_rotary_embed = RotaryEmbedding(
+            cos_emb=self.cos_emb_freq, sin_emb=self.sin_emb_freq
+        )
+
         self.layers = nn.ModuleList([])
         if use_shared_bias:
             hidden_size = head_dim * num_heads
@@ -249,6 +262,7 @@ class BSRoformer(nn.Module):
                 dropout=dropout,
                 shared_qkv_bias=self.shared_qkv_bias,
                 shared_out_bias=self.shared_out_bias,
+                rotary_embed=time_rotary_embed,
             )
             band_roformer = Transformer(
                 input_dim=dim,
@@ -259,6 +273,7 @@ class BSRoformer(nn.Module):
                 dropout=dropout,
                 shared_qkv_bias=self.shared_qkv_bias,
                 shared_out_bias=self.shared_out_bias,
+                rotary_embed=freq_rotary_embed,
             )
             self.layers.append(nn.ModuleList([time_roformer, band_roformer]))
 
