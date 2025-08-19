@@ -507,7 +507,7 @@ def load_start_checkpoint(
             state_dict = torch.load(
                 args.start_check_point, map_location=device, weights_only=True
             )
-        model.load_state_dict(state_dict, strict=True)
+        model.load_state_dict(state_dict, strict=False)
 
     if args.lora_checkpoint:
         print(f"Loading LoRA weights from: {args.lora_checkpoint}")
