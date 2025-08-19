@@ -157,7 +157,7 @@ class MaskEstimator(nn.Module):
                     band_mask_mlp(
                         input_dim=input_dim,
                         band_dim=sub_band_freqs,
-                        hidden_dim=sub_band_freqs * mlp_expansion_factor,
+                        hidden_dim=input_dim * mlp_expansion_factor,
                         depth=depth,
                     ),
                     nn.GLU(dim=-1),
