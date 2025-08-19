@@ -1,702 +1,439 @@
-from __future__ import annotations
-
-from functools import partial
-
 import torch
-import torch.nn.functional as F
-from beartype import beartype
-from beartype.typing import Callable
-from einops import pack, rearrange, unpack
-from einops.layers.torch import Rearrange
-from torch import nn
-from torch.nn import Module, ModuleList
-from torch.utils.checkpoint import checkpoint
+import torch.nn as nn
+import torch.utils.checkpoint
+import librosa
+import numpy as np
+import einops
+from .transformer import Transformer, RMSNorm
 
-from ..utils.attend import Attend
-
-try:
-    from ..utils.attend_sage import AttendSage
-except ImportError:
-    pass
+from typing import List, Tuple
 
 
-def l2norm(t):
-    return F.normalize(t, dim=-1, p=2)
+def checkpoint_bypass(f, *args):
+    return f(*args)
 
 
-class CustomNorm(Module):
-    def __init__(self, dim, eps: float = 5.960464477539063e-08):  # 0x1p-24
-        super().__init__()
-        self.scale = dim**0.5
-        self.gamma = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-
-    def forward(self, x):
-        l2_norm = torch.linalg.norm(x, dim=-1, keepdim=True)
-        denom = torch.maximum(l2_norm, torch.full_like(l2_norm, self.eps))
-        normalized_x = x / denom
-        return normalized_x * self.scale * self.gamma
-
-
-# attention
-
-
-class RotaryEmbedding(nn.Module):
-    def __init__(self, cos_emb, sin_emb):
-        super().__init__()
-        # both (seq_len_for_rotation, dim_head)
-        self.cos_emb = cos_emb
-        self.sin_emb = sin_emb
-
-    def rotate_half(self, x):
-        x = rearrange(x, "... (d r) -> ... d r", r=2)
-        x1, x2 = x.unbind(dim=-1)
-        x = torch.stack((-x2, x1), dim=-1)
-        return rearrange(x, "... d r -> ... (d r)")
-
-    def forward(self, x):
-        # x is (batch_eff, heads, seq_len_for_rotation, dim_head)
-        cos_b = self.cos_emb.unsqueeze(0).unsqueeze(0).to(x.device, x.dtype)
-        sin_b = self.sin_emb.unsqueeze(0).unsqueeze(0).to(x.device, x.dtype)
-
-        term1 = x * cos_b
-        term2 = self.rotate_half(x) * sin_b
-
-        sum = term1.to(torch.float32) + term2.to(torch.float32)
-        return sum.to(x.dtype)
-
-
-class FeedForward(Module):
-    def __init__(self, dim, mult=4, dropout=0.0):
-        super().__init__()
-        dim_inner = int(dim * mult)
-        self.net = nn.Sequential(
-            CustomNorm(dim),
-            nn.Linear(dim, dim_inner),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_inner, dim),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class Attention(Module):
-    def __init__(
-        self,
-        dim,
-        heads=8,
-        dim_head=64,
-        dropout=0.0,
-        shared_qkv_bias=None,
-        shared_out_bias=None,
-        rotary_embed: RotaryEmbedding | None = None,
-        flash=True,
-        sage_attention=False,
-    ):
-        super().__init__()
-        self.heads = heads
-        self.scale = dim_head**-0.5
-        dim_inner = heads * dim_head
-
-        self.rotary_embed = rotary_embed
-
-        if sage_attention:
-            self.attend = AttendSage(flash=flash, dropout=dropout)  # type: ignore
-        else:
-            self.attend = Attend(flash=flash, dropout=dropout)  # type: ignore
-
-        self.norm = CustomNorm(dim)
-        self.to_qkv = nn.Linear(dim, dim_inner * 3, bias=(shared_qkv_bias is not None))
-        if shared_qkv_bias is not None:
-            self.to_qkv.bias = shared_qkv_bias
-
-        self.to_gates = nn.Linear(dim, heads)
-
-        self.to_out = nn.Sequential(
-            nn.Linear(dim_inner, dim, bias=(shared_out_bias is not None)),
-            nn.Dropout(dropout),
-        )
-        if shared_out_bias is not None:
-            self.to_out[0].bias = shared_out_bias
-
-    def forward(self, x):
-        x = self.norm(x)
-
-        qkv = self.to_qkv(x)
-        q, k, v = rearrange(qkv, "b n (qkv h d) -> qkv b h n d", qkv=3, h=self.heads)
-
-        if self.rotary_embed is not None:
-            q = self.rotary_embed(q)
-            k = self.rotary_embed(k)
-
-        out = self.attend(q, k, v)
-
-        gates = self.to_gates(x)
-        gate_act = gates.sigmoid()
-
-        out = out * rearrange(gate_act, "b n h -> b h n 1")
-
-        out = rearrange(out, "b h n d -> b n (h d)")
-        out = self.to_out(out)
-        return out
-
-
-class LinearAttention(Module):
+def build_mel_band_indices(
+    sample_rate: int,
+    n_fft: int,
+    n_bands: int,
+) -> list[np.ndarray[int]]:
     """
-    this flavor of linear attention proposed in https://arxiv.org/abs/2106.09681 by El-Nouby et al.
+    各 Mel バンドがカバーする「周波数ビン番号だけ」を返す。
+    返り値: list[np.ndarray]  (len = n_bands)
     """
+    # --- Mel フィルタ → 0/1 マスク --------------------------------
+    mel_fb = librosa.filters.mel(sr=sample_rate, n_fft=n_fft, n_mels=n_bands)
+    mel_fb[0, 0] = 1.0
+    mel_fb[-1, -1] = 1.0
+    mask = mel_fb > 0  # (B, F) bool
 
-    @beartype
+    return [np.where(mask[b])[0].astype(np.int32) for b in range(n_bands)]
+
+
+def build_band_indices(
+    sample_rate: int = 44_100, n_fft: int = 2_048
+) -> Tuple[np.ndarray, List[np.ndarray]]:
+    """
+    BSRoformer 用バンド分割 (各バンドの bin 数が必ず閾値以上)。
+
+    Returns
+    -------
+    freqs : np.ndarray
+        rfft の周波数 (長さ n_fft//2 + 1) [Hz]
+    bands : List[np.ndarray]
+        各要素が「そのバンドに含まれるビン番号」の 1‑D 配列
+    """
+    freqs = np.fft.rfftfreq(n_fft, d=1 / sample_rate)
+
+    # バンドが始まるビンの周波数から必要 bin 数を決定
+    def bins_per_band(freq_hz: float) -> int:
+        if freq_hz < 1_000:  # 0‑1 kHz
+            return 2
+        elif freq_hz < 2_000:  # 1‑2 kHz
+            return 4
+        elif freq_hz < 4_000:  # 2‑4 kHz
+            return 12
+        elif freq_hz < 8_000:  # 4‑8 kHz
+            return 24
+        elif freq_hz < 16_000:  # 8‑16 kHz
+            return 48
+        else:  # ≥16 kHz → 後で 2 分割
+            return -1
+
+    freq_indices: List[np.ndarray] = []
+    idx = 0
+    n_bins = len(freqs)
+
+    while idx < n_bins:
+        # 16 kHz 以上は残りを 2 分割して終了
+        if freqs[idx] >= 16_000:
+            remaining = np.arange(idx, n_bins)
+            half = len(remaining) // 2
+            freq_indices.append(remaining[:half])
+            freq_indices.append(remaining[half:])
+            break
+
+        size = bins_per_band(freqs[idx])
+        band = np.arange(idx, min(idx + size, n_bins))
+        freq_indices.append(band)
+        idx += size  # bin数 単位で次へ
+
+    return freqs, freq_indices
+
+
+class BandSplit(torch.nn.Module):
     def __init__(
-        self,
-        *,
-        dim,
-        dim_head=32,
-        heads=8,
-        scale=8,
-        flash=False,
-        dropout=0.0,
-        sage_attention=False,
+        self, hidden_size: int, band_indices, num_channels: int, extra_windows: int
     ):
         super().__init__()
-        dim_inner = dim_head * heads
-        self.norm = CustomNorm(dim)
+        self.hidden_size = hidden_size
+        self.band_indices = band_indices
 
-        self.to_qkv = nn.Sequential(
-            nn.Linear(dim, dim_inner * 3, bias=False),
-            Rearrange("b n (qkv h d) -> qkv b h d n", qkv=3, h=heads),
-        )
+        for i, idx in enumerate(band_indices):
+            self.register_buffer(f"band_idx_{i}", torch.tensor(idx, dtype=torch.long))
 
-        self.temperature = nn.Parameter(torch.ones(heads, 1, 1))
-
-        if sage_attention:
-            self.attend = AttendSage(scale=scale, dropout=dropout, flash=flash)  # type: ignore
-        else:
-            self.attend = Attend(scale=scale, dropout=dropout, flash=flash)
-
-        self.to_out = nn.Sequential(
-            Rearrange("b h d n -> b n (h d)"), nn.Linear(dim_inner, dim, bias=False)
-        )
-
-    def forward(self, x):
-        x = self.norm(x)
-
-        q, k, v = self.to_qkv(x)
-
-        q, k = map(l2norm, (q, k))
-        q = q * self.temperature.exp()
-
-        out = self.attend(q, k, v)
-
-        return self.to_out(out)
-
-
-class Transformer(Module):
-    def __init__(
-        self,
-        *,
-        dim,
-        depth,
-        dim_head=64,
-        heads=8,
-        attn_dropout=0.0,
-        ff_dropout=0.0,
-        ff_mult=4,
-        norm_output=True,
-        rotary_embed: RotaryEmbedding | None = None,
-        flash_attn=True,
-        linear_attn=False,
-        sage_attention=False,
-        shared_qkv_bias=None,
-        shared_out_bias=None,
-    ):
-        super().__init__()
-        self.layers = ModuleList([])
-
-        for _ in range(depth):
-            attn: LinearAttention | Attention
-            if linear_attn:
-                attn = LinearAttention(
-                    dim=dim,
-                    dim_head=dim_head,
-                    heads=heads,
-                    dropout=attn_dropout,
-                    flash=flash_attn,
-                    sage_attention=sage_attention,
+        self.num_bands = len(band_indices)
+        self.projections = torch.nn.ModuleList([])
+        for i in range(self.num_bands):
+            sub_band_freqs = (
+                len(band_indices[i]) * num_channels * 2 * (extra_windows + 1)
+            )
+            self.projections.append(
+                torch.nn.Sequential(
+                    RMSNorm(sub_band_freqs),
+                    torch.nn.Linear(sub_band_freqs, hidden_size),
                 )
-            else:
-                attn = Attention(
-                    dim=dim,
-                    dim_head=dim_head,
-                    heads=heads,
-                    dropout=attn_dropout,
-                    shared_qkv_bias=shared_qkv_bias,
-                    shared_out_bias=shared_out_bias,
-                    rotary_embed=rotary_embed,
-                    flash=flash_attn,
-                    sage_attention=sage_attention,
-                )
-
-            self.layers.append(
-                ModuleList([attn, FeedForward(dim=dim, mult=ff_mult, dropout=ff_dropout)])
             )
 
-        self.norm = CustomNorm(dim) if norm_output else nn.Identity()
-
     def forward(self, x):
-        for attn, ff in self.layers:  # type: ignore
-            x = attn(x) + x
-            x = ff(x) + x
-        return self.norm(x)
+        # x: (B, T, C, F)
+        sub_band_list = []
+        for i, proj_layer in enumerate(self.projections):
+            band_indices = getattr(self, f"band_idx_{i}")
+            # サブバンドインデックスで周波数軸から抜きだす
+            sub_band = x[..., band_indices]  # (B, T, C, sub_band_freqs)
+            sub_band = einops.rearrange(sub_band, "b t c f -> b t (c f)")
+            sub_band = proj_layer(sub_band)  # (B, T, hidden_size)
+            sub_band_list.append(sub_band)
+
+        return torch.stack(sub_band_list, dim=-2)  # (B, T, num_bands, hidden_size)
 
 
-# bandsplit module
+def band_mask_mlp(input_dim, band_dim, hidden_dim, depth):
+    layers = []
+    # 入力→隠れ→…→隠れ→(band_dim*2) の構造
+    dims = [input_dim] + [hidden_dim] * depth + [band_dim * 2]
+    for i in range(len(dims) - 1):
+        layers.append(nn.Linear(dims[i], dims[i + 1]))
+        # 最終層の後に活性化は入れない
+        if i < len(dims) - 2:
+            layers.append(nn.Tanh())
+    return nn.Sequential(*layers)
 
 
-class BandSplit(Module):
-    @beartype
-    def __init__(self, dim, dim_inputs: tuple[int, ...]):
-        super().__init__()
-        self.dim_inputs = dim_inputs
-        self.to_features = ModuleList([])
-
-        for dim_in in dim_inputs:
-            net = nn.Sequential(CustomNorm(dim_in), nn.Linear(dim_in, dim))
-
-            self.to_features.append(net)
-
-    def forward(self, x):
-        x = x.split(self.dim_inputs, dim=-1)
-
-        outs = []
-        for split_input, to_feature in zip(x, self.to_features):
-            split_output = to_feature(split_input)
-            outs.append(split_output)
-
-        return torch.stack(outs, dim=-2)
-
-
-def MLP(
-    dim_in: int,
-    dim_out: int,
-    dim_hidden: int | None = None,
-    depth: int = 1,
-    activation=nn.Tanh,
-):
-    dim_hidden = dim_hidden or dim_in
-
-    net = []
-    dims = (dim_in, *((dim_hidden,) * (depth - 1)), dim_out)
-
-    for ind, (layer_dim_in, layer_dim_out) in enumerate(zip(dims[:-1], dims[1:])):
-        is_last = ind == (len(dims) - 2)
-
-        net.append(nn.Linear(layer_dim_in, layer_dim_out))
-
-        if is_last:
-            continue
-
-        net.append(activation())
-
-    return nn.Sequential(*net)
-
-
-class MaskEstimator(Module):
-    @beartype
-    def __init__(self, dim, dim_inputs: tuple[int, ...], depth, mlp_expansion_factor=4):
-        super().__init__()
-        self.dim_inputs = dim_inputs
-        self.to_freqs = ModuleList([])
-        dim_hidden = dim * mlp_expansion_factor
-
-        for dim_in in dim_inputs:
-            mlp = nn.Sequential(
-                MLP(dim, dim_in * 2, dim_hidden=dim_hidden, depth=depth), nn.GLU(dim=-1)
-            )
-
-            self.to_freqs.append(mlp)
-
-    def forward(self, x):
-        x = x.unbind(dim=-2)
-
-        outs = []
-
-        for band_features, mlp in zip(x, self.to_freqs):
-            freq_out = mlp(band_features)
-            outs.append(freq_out)
-
-        return torch.cat(outs, dim=-1)
-
-
-# fmt: off
-DEFAULT_FREQS_PER_BANDS = (
-    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    12, 12, 12, 12, 12, 12, 12, 12,
-    24, 24, 24, 24, 24, 24, 24, 24,
-    48, 48, 48, 48, 48, 48, 48, 48,
-    128, 129
-)
-# fmt: on
-
-
-class BSRoformer(Module):
-    @beartype
+class MaskEstimator(nn.Module):
     def __init__(
         self,
-        dim,
-        *,
-        depth,
-        stereo=False,
-        num_stems=1,
-        time_transformer_depth=2,
-        freq_transformer_depth=2,
-        linear_transformer_depth=0,
-        freqs_per_bands: tuple[
-            int, ...
-        ] = DEFAULT_FREQS_PER_BANDS,  # in the paper, they divide into ~60 bands, test with 1 for starters
-        dim_head=64,
-        heads=8,
-        attn_dropout=0.0,
-        ff_dropout=0.0,
-        flash_attn=True,
-        stft_n_fft=2048,
-        stft_hop_length=512,  # 10ms at 44100Hz, from sections 4.1, 4.4 in the paper - @faroit recommends // 2 or // 4 for better reconstruction
-        stft_win_length=2048,
-        stft_normalized=False,
-        stft_window_fn: Callable | None = None,
-        mask_estimator_depth=2,
-        multi_stft_resolution_loss_weight=1.0,
-        multi_stft_resolutions_window_sizes: tuple[int, ...] = (
-            4096,
-            2048,
-            1024,
-            512,
-            256,
-        ),
-        multi_stft_hop_size=147,
-        multi_stft_normalized=False,
-        multi_stft_window_fn: Callable = torch.hann_window,
-        mlp_expansion_factor=4,
-        use_torch_checkpoint=False,
-        skip_connection=False,
-        sage_attention=False,
-        use_shared_bias=False,
-        chunk_size: int = 588800,
+        input_dim: int,
+        band_indices,
+        num_channels: int,
+        mlp_expansion_factor: int = 4,
+        depth: int = 2,
     ):
         super().__init__()
+        self.input_dim = input_dim
+        self.num_channels = num_channels
+        self.band_indices = band_indices
 
-        self.stereo = stereo
-        self.audio_channels = 2 if stereo else 1
+        self.num_bands = len(band_indices)
+        self.projections = torch.nn.ModuleList([])
+        for i in range(self.num_bands):
+            sub_band_freqs = len(band_indices[i]) * num_channels * 2
+            self.projections.append(
+                nn.Sequential(
+                    band_mask_mlp(
+                        input_dim=input_dim,
+                        band_dim=sub_band_freqs,
+                        hidden_dim=sub_band_freqs * mlp_expansion_factor,
+                        depth=depth,
+                    ),
+                    nn.GLU(dim=-1),
+                )
+            )
+
+    def forward(self, x):
+        # x: (B, T, K, D)
+        out = []
+        sub_band_list = torch.unbind(x, dim=2)  # list([B, T, D])
+        assert len(sub_band_list) == len(self.projections)
+
+        for i, proj_layer in enumerate(self.projections):
+            sub_band = proj_layer(sub_band_list[i])  # (B, T, sub_band_freqs)
+            sub_band = einops.rearrange(
+                sub_band,
+                "b t (c f) -> b t c f",
+                c=self.num_channels * 2,
+                f=len(self.band_indices[i]),
+            )
+            out.append(sub_band)
+
+        return torch.concat(out, dim=-1)  # (B, T, C, F)
+
+
+class BSRoformer(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_layers: int = 12,
+        sample_rate: int = 44100,
+        num_channels: int = 2,
+        head_dim: int = 64,
+        num_heads: int = 8,
+        n_fft: int = 2048,
+        hop_length: int = 512,
+        n_bands: int = 60,
+        num_stems: int = 2,
+        band_split_type: str = "bs",
+        ffn_hidden_size_factor: int = 4,
+        dropout: float = 0.0,
+        use_shared_bias: bool = True,
+        use_gradient_checkpoint=True,
+    ):
+        super().__init__()
+        self.n_fft = n_fft
+        self.window_size = n_fft
+        self.hop_length = hop_length
+        self.num_channels = num_channels
         self.num_stems = num_stems
-        self.use_torch_checkpoint = use_torch_checkpoint
-        self.skip_connection = skip_connection
+        self.band_split_type = band_split_type
+        self.use_gradient_checkpoint = use_gradient_checkpoint
 
-        self.layers = ModuleList([])
+        if band_split_type == "bs":
+            _, self.band_indices = build_band_indices(
+                sample_rate=sample_rate, n_fft=n_fft
+            )
+        elif band_split_type == "mel":
+            self.band_indices = build_mel_band_indices(
+                sampling_rate=sample_rate, n_fft=n_fft, n_bands=n_bands
+            )
+        else:
+            raise NotImplementedError("サポートしていない band_split_type です")
 
-        if sage_attention:
-            print("Use Sage Attention")
+        self.register_buffer("hann_window", torch.hann_window(self.window_size))
+        self.num_bands = len(self.band_indices)
+        self.band_split = BandSplit(
+            hidden_size=dim,
+            band_indices=self.band_indices,
+            num_channels=num_channels,
+            extra_windows=0,
+        )
 
+        self.layers = nn.ModuleList([])
         if use_shared_bias:
-            dim_inner = heads * dim_head
-            self.shared_qkv_bias = nn.Parameter(torch.ones(dim_inner * 3))
-            self.shared_out_bias = nn.Parameter(torch.ones(dim))
+            hidden_size = head_dim * num_heads
+            self.linear_62_bias_0 = nn.Parameter(torch.ones(hidden_size * 3))  # QKV
+            self.linear_64_bias_0 = nn.Parameter(torch.ones(dim))  # OUT
 
-        transformer_kwargs = dict(
-            dim=dim,
-            heads=heads,
-            dim_head=dim_head,
-            attn_dropout=attn_dropout,
-            ff_dropout=ff_dropout,
-            flash_attn=flash_attn,
-            norm_output=False,
-            sage_attention=sage_attention,
-            shared_qkv_bias=self.shared_qkv_bias,
-            shared_out_bias=self.shared_out_bias,
+        for _ in range(num_layers):
+            time_roformer = Transformer(
+                input_dim=dim,
+                head_dim=head_dim,
+                num_layers=1,
+                num_heads=num_heads,
+                ffn_hidden_size_factor=ffn_hidden_size_factor,
+                dropout=dropout,
+            )
+            band_roformer = Transformer(
+                input_dim=dim,
+                head_dim=head_dim,
+                num_layers=1,
+                num_heads=num_heads,
+                ffn_hidden_size_factor=ffn_hidden_size_factor,
+                dropout=dropout,
+            )
+            self.layers.append(nn.ModuleList([time_roformer, band_roformer]))
+
+        self.out_norm = RMSNorm(dim)
+
+        self.register_buffer(
+            "freq_indices",
+            torch.tensor(np.concatenate(self.band_indices), dtype=torch.long),
+            persistent=False,
         )
-
-        t_frames = chunk_size // stft_hop_length + 1  # e.g. 588800 // 512 + 1 = 1151
-        self.cos_emb_time = nn.Parameter(torch.zeros(t_frames, dim_head))
-        self.sin_emb_time = nn.Parameter(torch.zeros(t_frames, dim_head))
-        time_rotary_embed = RotaryEmbedding(cos_emb=self.cos_emb_time, sin_emb=self.sin_emb_time)
-
-        num_bands = len(freqs_per_bands)  # e.g. 62
-        self.cos_emb_freq = nn.Parameter(torch.zeros(num_bands, dim_head))
-        self.sin_emb_freq = nn.Parameter(torch.zeros(num_bands, dim_head))
-        freq_rotary_embed = RotaryEmbedding(cos_emb=self.cos_emb_freq, sin_emb=self.sin_emb_freq)
-
-        for _ in range(depth):
-            tran_modules = []
-            if linear_transformer_depth > 0:
-                tran_modules.append(
-                    Transformer(
-                        depth=linear_transformer_depth,
-                        linear_attn=True,
-                        **transformer_kwargs,
-                    )
+        # そのビンが何本のバンドに含まれるかを数える
+        counts = np.zeros(n_fft // 2 + 1, dtype=np.float32)
+        for idx in self.band_indices:
+            counts[idx] += 1
+        self.register_buffer(
+            "num_bands_per_freq",
+            torch.tensor(counts, dtype=torch.float32),
+            persistent=False,
+        )  # shape (F_total,)
+        self.mask_estimators = nn.ModuleList(
+            [
+                MaskEstimator(
+                    input_dim=dim,
+                    band_indices=self.band_indices,
+                    num_channels=num_channels,
+                    mlp_expansion_factor=1,
                 )
-            tran_modules.append(
-                Transformer(
-                    depth=time_transformer_depth,
-                    rotary_embed=time_rotary_embed,
-                    **transformer_kwargs,
-                )
-            )
-            tran_modules.append(
-                Transformer(
-                    depth=freq_transformer_depth,
-                    rotary_embed=freq_rotary_embed,
-                    **transformer_kwargs,
-                )
-            )
-            self.layers.append(nn.ModuleList(tran_modules))
-
-        self.final_norm = CustomNorm(dim)
-
-        self.stft_kwargs = dict(
-            n_fft=stft_n_fft,
-            hop_length=stft_hop_length,
-            win_length=stft_win_length,
-            normalized=stft_normalized,
+                for _ in range(num_stems)
+            ]
         )
 
-        self.stft_window_fn = partial(stft_window_fn or torch.hann_window, stft_win_length)
+    def to_spectrogram(self, inputs: torch.Tensor) -> torch.Tensor:
+        # (B, C, T)
+        inputs = einops.rearrange(inputs, "b c t -> (b c) t")
 
-        freqs_per_bands_with_complex = tuple(2 * f * self.audio_channels for f in freqs_per_bands)
+        windows: list[torch.Tensor] = [self.hann_window]
 
-        self.band_split = BandSplit(dim=dim, dim_inputs=freqs_per_bands_with_complex)
-
-        self.mask_estimators = nn.ModuleList([])
-
-        for _ in range(num_stems):
-            mask_estimator = MaskEstimator(
-                dim=dim,
-                dim_inputs=freqs_per_bands_with_complex,
-                depth=mask_estimator_depth,
-                mlp_expansion_factor=mlp_expansion_factor,
-            )
-
-            self.mask_estimators.append(mask_estimator)
-
-        # for the multi-resolution stft loss
-
-        self.multi_stft_resolution_loss_weight = multi_stft_resolution_loss_weight
-        self.multi_stft_resolutions_window_sizes = multi_stft_resolutions_window_sizes
-        self.multi_stft_n_fft = stft_n_fft
-        self.multi_stft_window_fn = multi_stft_window_fn
-
-        self.multi_stft_kwargs = dict(
-            hop_length=multi_stft_hop_size, normalized=multi_stft_normalized
-        )
-
-    def forward(self, raw_audio, target=None, return_loss_breakdown=False):
-        """
-        einops
-
-        b - batch
-        f - freq
-        t - time
-        s - audio channel (1 for mono, 2 for stereo)
-        n - number of 'stems'
-        c - complex (2)
-        d - feature dimension
-        """
-
-        device = raw_audio.device
-
-        # defining whether model is loaded on MPS (MacOS GPU accelerator)
-        x_is_mps = True if device.type == "mps" else False
-
-        if raw_audio.ndim == 2:
-            raw_audio = rearrange(raw_audio, "b t -> b 1 t")
-
-        channels = raw_audio.shape[1]
-        assert (not self.stereo and channels == 1) or (self.stereo and channels == 2), (
-            "stereo needs to be set to True if passing in audio signal that is stereo (channel dimension of 2). also need to be False if mono (channel dimension of 1)"
-        )
-
-        # to stft
-
-        raw_audio, batch_audio_channel_packed_shape = pack([raw_audio], "* t")
-
-        stft_window = self.stft_window_fn(device=device)
-
-        # RuntimeError: FFT operations are only supported on MacOS 14+
-        # Since it's tedious to define whether we're on correct MacOS version - simple try-catch is used
-        try:
-            stft_repr = torch.stft(
-                raw_audio, **self.stft_kwargs, window=stft_window, return_complex=True
-            )
-        except Exception:
-            stft_repr = torch.stft(
-                raw_audio.cpu() if x_is_mps else raw_audio,
-                **self.stft_kwargs,
-                window=stft_window.cpu() if x_is_mps else stft_window,
+        spectrograms = []
+        for win in windows:
+            spectrogram = torch.stft(
+                input=inputs,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.window_size,
+                window=win.to(inputs.device),
+                center=True,
                 return_complex=True,
-            ).to(device)
-        stft_repr = torch.view_as_real(stft_repr)
-
-        stft_repr = unpack(stft_repr, batch_audio_channel_packed_shape, "* f t c")[0]
-
-        # merge stereo / mono into the frequency, with frequency leading dimension, for band splitting
-        stft_repr = rearrange(stft_repr, "b s f t c -> b (f s) t c")
-
-        x = rearrange(stft_repr, "b f t c -> b t (f c)")
-
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            raise RuntimeError(
-                f"NaN/Inf in x after stft: {x.isnan().sum()} NaNs, {x.isinf().sum()} Infs"
             )
+            spectrogram = einops.rearrange(
+                spectrogram, "(b c) f t -> b c f t", c=self.num_channels
+            )
+            spectrograms.append(spectrogram)  # list of [B, C, F, T]
 
-        if self.use_torch_checkpoint:
-            x = checkpoint(self.band_split, x, use_reentrant=False)
+        spectrogram = torch.concat(spectrograms, dim=1)
+        spectrogram = torch.view_as_real(spectrogram)
+        spectrogram = einops.rearrange(spectrogram, "b c f t s -> b (c s) t f", s=2)
+        return spectrogram, spectrograms[0]
+
+    def mixture_consistency_projection(
+        self,
+        source_estimates: torch.Tensor,  # [B, C, N, F, T] complex
+        mixture: torch.Tensor,  # [B, C, F, T] complex
+        weights: torch.Tensor | None = None,  # [B, C, N, F, T] real, 任意
+    ) -> torch.Tensor:
+        residual = mixture[:, :, None] - source_estimates.sum(dim=2, keepdim=True)
+        if weights is None:
+            correction = residual / source_estimates.shape[2]
         else:
-            x = self.band_split(x)
+            weights = weights / (weights.sum(dim=2, keepdim=True) + 1e-8)
+            correction = weights * residual
+        return source_estimates + correction
 
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            raise RuntimeError(
-                f"NaN/Inf in x after band_split: {x.isnan().sum()} NaNs, {x.isinf().sum()} Infs"
-            )
+    def to_recon_audio(
+        self,
+        mask: torch.Tensor,
+        original_spec_complex: torch.Tensor,
+        original_length: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        # mask: [B, C, N, F, T]
+        source_estimates = original_spec_complex[:, :, None] * mask
 
-        # axial / hierarchical attention
-
-        store = [None] * len(self.layers)
-        for i, transformer_block in enumerate(self.layers):
-            if len(transformer_block) == 3:
-                linear_transformer, time_transformer, freq_transformer = transformer_block
-
-                x, ft_ps = pack([x], "b * d")
-                if self.use_torch_checkpoint:
-                    x = checkpoint(linear_transformer, x, use_reentrant=False)
-                else:
-                    x = linear_transformer(x)
-                (x,) = unpack(x, ft_ps, "b * d")
-            else:
-                time_transformer, freq_transformer = transformer_block
-
-            if self.skip_connection:
-                # Sum all previous
-                for j in range(i):
-                    x = x + store[j]
-
-            x = rearrange(x, "b t f d -> b f t d")
-            x, ps = pack([x], "* t d")
-
-            if self.use_torch_checkpoint:
-                x = checkpoint(time_transformer, x, use_reentrant=False)
-            else:
-                x = time_transformer(x)
-
-            (x,) = unpack(x, ps, "* t d")
-            x = rearrange(x, "b f t d -> b t f d")
-            x, ps = pack([x], "* f d")
-
-            if self.use_torch_checkpoint:
-                x = checkpoint(freq_transformer, x, use_reentrant=False)
-            else:
-                x = freq_transformer(x)
-
-            (x,) = unpack(x, ps, "* f d")
-
-            if self.skip_connection:
-                store[i] = x
-
-        x = self.final_norm(x)
-
-        num_stems = len(self.mask_estimators)
-
-        if self.use_torch_checkpoint:
-            mask = torch.stack(
-                [checkpoint(fn, x, use_reentrant=False) for fn in self.mask_estimators],
-                dim=1,
-            )
-        else:
-            mask = torch.stack([fn(x) for fn in self.mask_estimators], dim=1)
-        mask = rearrange(mask, "b n t (f c) -> b n f t c", c=2)
-
-        # modulate frequency representation
-
-        stft_repr = rearrange(stft_repr, "b f t c -> b 1 f t c")
-
-        # complex number multiplication
-
-        stft_repr = torch.view_as_complex(stft_repr)
-        mask = torch.view_as_complex(mask)
-
-        stft_repr = stft_repr * mask
-
-        # istft
-
-        stft_repr = rearrange(stft_repr, "b n (f s) t -> (b n s) f t", s=self.audio_channels)
-
-        # same as torch.stft() fix for MacOS MPS above
-        try:
-            recon_audio = torch.istft(
-                stft_repr,
-                **self.stft_kwargs,
-                window=stft_window,
-                return_complex=False,
-                length=raw_audio.shape[-1],
-            )
-        except Exception:
-            recon_audio = torch.istft(
-                stft_repr.cpu() if x_is_mps else stft_repr,
-                **self.stft_kwargs,
-                window=stft_window.cpu() if x_is_mps else stft_window,
-                return_complex=False,
-                length=raw_audio.shape[-1],
-            ).to(device)
-
-        recon_audio = rearrange(
-            recon_audio, "(b n s) t -> b n s t", s=self.audio_channels, n=num_stems
+        # mixture consistency
+        magnitude = source_estimates.abs().clamp_min(1e-8)
+        weights = magnitude**2
+        separated_spectrogram = self.mixture_consistency_projection(
+            source_estimates=source_estimates,
+            mixture=original_spec_complex,
+            weights=weights,
         )
 
-        if num_stems == 1:
-            recon_audio = rearrange(recon_audio, "b 1 s t -> b s t")
+        separated_spectrogram = einops.rearrange(
+            separated_spectrogram, "b c n f t -> (b c n) f t"
+        )
+        recon_audio = torch.istft(
+            separated_spectrogram,
+            n_fft=self.window_size,
+            hop_length=self.hop_length,
+            win_length=self.window_size,
+            window=self.hann_window.to(device),
+            center=True,
+            return_complex=False,
+            length=original_length,
+        )  # [B*C, T]
+        recon_audio = einops.rearrange(
+            recon_audio, "(b c n) t -> b c n t", c=self.num_channels, n=self.num_stems
+        )
+        recon_audio = einops.rearrange(recon_audio, "b c n t -> b n c t")
+        return recon_audio
 
-        # if a target is passed in, calculate loss for learning
+    def forward(self, x):
+        # x: (B, C, T)
+        if self.use_gradient_checkpoint or self.training:
+            checkpoint = torch.utils.checkpoint.checkpoint
+        else:
+            checkpoint = checkpoint_bypass
 
-        if target is None:
-            return recon_audio
+        istft_length = x.shape[-1]
+        x, original_spec_complex = self.to_spectrogram(x)  # x: [B, C*S, T, F]
+        x = einops.rearrange(x, "b c t f -> b t c f")
 
-        if self.num_stems > 1:
-            assert target.ndim == 4 and target.shape[1] == self.num_stems
+        # 勾配が流れない問題に対処
+        x = checkpoint(
+            self.band_split, x, use_reentrant=False
+        )  # (B, T, K, hidden_size)
 
-        if target.ndim == 2:
-            target = rearrange(target, "... t -> ... 1 t")
+        for time_roformer, band_roformer in self.layers:
+            B, T, K, F = x.shape
+            # 時間軸Transformer
+            x = einops.rearrange(x, "b t k f -> (b k) t f")  # [B*K, T, F]
+            x = checkpoint(time_roformer, x, use_reentrant=False)
+            x = einops.rearrange(x, "(b k) t f -> b t k f", k=K)  # [B, T, K, F]
 
-        target = target[..., : recon_audio.shape[-1]]  # protect against lost length on istft
+            # バンド軸Transformer
+            x = x.reshape(B * T, K, F)  # [B*T, K, F]
+            x = checkpoint(band_roformer, x, use_reentrant=False)
+            x = x.reshape(B, T, K, F)
 
-        loss = F.l1_loss(recon_audio, target)
+        x = self.out_norm(x)
 
-        multi_stft_resolution_loss = 0.0
+        # 音源分離マスク
+        mask_list = []
+        for mask_estimator in self.mask_estimators:
+            pred_mask = checkpoint(
+                mask_estimator, x, use_reentrant=False
+            )  # [B, T, C*S, F]
+            pred_mask = einops.rearrange(
+                pred_mask, "b t (c s) f -> b t c f s", s=2
+            ).contiguous()
+            pred_mask = torch.view_as_complex(pred_mask)  # [B, T, C, F]
+            mask_list.append(pred_mask)
 
-        for window_size in self.multi_stft_resolutions_window_sizes:
-            res_stft_kwargs = dict(
-                n_fft=max(
-                    window_size, self.multi_stft_n_fft
-                ),  # not sure what n_fft is across multi resolution stft
-                win_length=window_size,
-                return_complex=True,
-                window=self.multi_stft_window_fn(window_size, device=device),
-                **self.multi_stft_kwargs,
+        mask_all = torch.stack(mask_list, dim=-2)  # [B, T, C, N, F]
+        if self.band_split_type == "mel":
+            # 周波数ビンで重なる部分を加算する
+            B, T, C, N, F_concat = mask_all.shape
+            F_total = self.n_fft // 2 + 1
+            mask_sum = torch.zeros(
+                (B, T, C, N, F_total), dtype=mask_all.dtype, device=mask_all.device
+            )
+            freq_idx = self.freq_indices.view(1, 1, 1, 1, -1).expand(
+                B, T, C, N, -1
+            )  # [B, T, C, N, F_concat]
+            mask_sum.scatter_add_(
+                dim=-1,
+                index=freq_idx,
+                src=mask_all,
             )
 
-            recon_Y = torch.stft(rearrange(recon_audio, "... s t -> (... s) t"), **res_stft_kwargs)
-            target_Y = torch.stft(rearrange(target, "... s t -> (... s) t"), **res_stft_kwargs)
+            # 重なった本数で割って平均
+            denom = self.num_bands_per_freq.clamp(min=1e-8)  # [F_total]
+            denom = denom.view(1, 1, 1, 1, -1)  # broadcast
+            mask_avg = mask_sum / denom  # [B, T, C, N, F_total]
+            mask_avg = einops.rearrange(mask_avg, "b t c n f -> b c n f t")
+        else:
+            mask_avg = einops.rearrange(mask_all, "b t c n f -> b c n f t")
 
-            multi_stft_resolution_loss = multi_stft_resolution_loss + F.l1_loss(recon_Y, target_Y)
-
-        weighted_multi_resolution_loss = (
-            multi_stft_resolution_loss * self.multi_stft_resolution_loss_weight
+        recon_audio = self.to_recon_audio(
+            mask=mask_avg,
+            original_spec_complex=original_spec_complex,
+            original_length=istft_length,
+            dtype=x.dtype,
+            device=x.device,
         )
-
-        total_loss = loss + weighted_multi_resolution_loss
-
-        if not return_loss_breakdown:
-            return total_loss
-
-        return total_loss, (loss, multi_stft_resolution_loss)
+        return recon_audio

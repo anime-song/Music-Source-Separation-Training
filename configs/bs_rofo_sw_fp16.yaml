@@ -10,11 +10,9 @@ audio:
 
 model:
   dim: 256
-  depth: 12
+  num_layers: 12
   stereo: true
   num_stems: 6
-  time_transformer_depth: 1
-  freq_transformer_depth: 1
   use_shared_bias: True
 
 training:
