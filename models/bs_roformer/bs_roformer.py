@@ -284,7 +284,7 @@ class BSRoformer(nn.Module):
                     input_dim=dim,
                     band_indices=self.band_indices,
                     num_channels=num_channels,
-                    mlp_expansion_factor=1,
+                    mlp_expansion_factor=4,
                 )
                 for _ in range(num_stems)
             ]
