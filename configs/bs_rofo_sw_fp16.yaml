@@ -11,7 +11,6 @@ audio:
 model:
   dim: 256
   num_layers: 12
-  stereo: true
   num_stems: 6
   use_shared_bias: True
 

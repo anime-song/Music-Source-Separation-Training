@@ -333,20 +333,6 @@ class BSRoformer(nn.Module):
         spectrogram = einops.rearrange(spectrogram, "b c f t s -> b (c s) t f", s=2)
         return spectrogram, spectrograms[0]
 
-    def mixture_consistency_projection(
-        self,
-        source_estimates: torch.Tensor,  # [B, C, N, F, T] complex
-        mixture: torch.Tensor,  # [B, C, F, T] complex
-        weights: torch.Tensor | None = None,  # [B, C, N, F, T] real, 任意
-    ) -> torch.Tensor:
-        residual = mixture[:, :, None] - source_estimates.sum(dim=2, keepdim=True)
-        if weights is None:
-            correction = residual / source_estimates.shape[2]
-        else:
-            weights = weights / (weights.sum(dim=2, keepdim=True) + 1e-8)
-            correction = weights * residual
-        return source_estimates + correction
-
     def to_recon_audio(
         self,
         mask: torch.Tensor,
@@ -358,17 +344,8 @@ class BSRoformer(nn.Module):
         # mask: [B, C, N, F, T]
         source_estimates = original_spec_complex[:, :, None] * mask
 
-        # mixture consistency
-        magnitude = source_estimates.abs().clamp_min(1e-8)
-        weights = magnitude**2
-        separated_spectrogram = self.mixture_consistency_projection(
-            source_estimates=source_estimates,
-            mixture=original_spec_complex,
-            weights=weights,
-        )
-
         separated_spectrogram = einops.rearrange(
-            separated_spectrogram, "b c n f t -> (b c n) f t"
+            source_estimates, "b c n f t -> (b c n) f t"
         )
         recon_audio = torch.istft(
             separated_spectrogram,
